@@ -5,12 +5,19 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node download-certificates.js"
+    "start": "node download-certificates.js",
+    "setup-drive": "node setup-google-drive.js"
   },
-  "keywords": ["automation", "playwright", "certificate"],
+  "keywords": [
+    "automation",
+    "playwright",
+    "certificate"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "dotenv": "^18.0.8",
+    "googleapis": "^186.0.0",
     "playwright": "^1.48.0"
   }
 }

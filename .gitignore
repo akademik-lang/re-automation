@@ -1,4 +1,10 @@
 node_modules/
 downloads/
+.env
+credentials.json
+token.json
 *.log
 .DS_Store
+.env
+credentials.json
+token.json

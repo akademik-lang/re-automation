@@ -2,15 +2,22 @@ import { chromium } from 'playwright';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
+import { authorize, uploadFile } from './google-drive.js';
+
+// Load environment variables
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Konfigurasi
-const LOGIN_URL = 'https://usi-re.mandiribelajar.co.id/login/index.php';
-const CERT_URL = 'https://usi-re.mandiribelajar.co.id/mod/customcert/view.php?id=7040';
-const USERNAME = 'faiq.re';
-const PASSWORD = 'faiq.re1234';
+// Konfigurasi dari .env
+const LOGIN_URL = process.env.LOGIN_URL;
+const CERT_URL = process.env.CERT_URL;
+const USERNAME = process.env.MOODLE_USERNAME;
+const PASSWORD = process.env.MOODLE_PASSWORD;
+const GOOGLE_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
+const GOOGLE_CREDENTIALS_PATH = process.env.GOOGLE_CREDENTIALS_PATH || './credentials.json';
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 
 // Buat folder downloads kalau belum ada
@@ -21,19 +28,39 @@ if (!fs.existsSync(DOWNLOAD_DIR)) {
 async function downloadCertificates() {
   console.log('🚀 Starting automation...');
   
-  // Launch browser
+  // Check if Google Drive is configured
+  const useGoogleDrive = GOOGLE_DRIVE_FOLDER_ID && fs.existsSync(GOOGLE_CREDENTIALS_PATH) && fs.existsSync('token.json');
+  
+  let driveAuth = null;
+  if (useGoogleDrive) {
+    try {
+      driveAuth = await authorize(GOOGLE_CREDENTIALS_PATH);
+      console.log('✅ Google Drive connected');
+    } catch (error) {
+      console.log('⚠️  Google Drive not configured. Run: npm run setup-drive');
+      console.log('   Files will be saved locally only.\n');
+    }
+  } else {
+    console.log('⚠️  Google Drive not configured. Files will be saved locally only.\n');
+  }
+  
+  // Launch browser with visible window
   const browser = await chromium.launch({
-    headless: false, // Set true kalau mau background
+    headless: false, // Show browser window so you can see the progress
   });
   
   const context = await browser.newContext({
     acceptDownloads: true
   });
   
+  // Set longer timeout for slow certificate generation
+  context.setDefaultTimeout(120000); // 2 minutes timeout
+  
   const page = await context.newPage();
   
+  let apiContext = null;
+  
   try {
-    // Step 1: Login
     console.log('🔐 Logging in...');
     await page.goto(LOGIN_URL);
     
@@ -113,6 +140,27 @@ async function downloadCertificates() {
     // Step 3: Get all rows from the table
     console.log('📊 Extracting student data...');
     
+    // Get sesskey from page for authenticated downloads
+    const sesskey = await page.evaluate(() => {
+      const sesskeyInput = document.querySelector('input[name="sesskey"]');
+      if (sesskeyInput) return sesskeyInput.value;
+      
+      // Try to find in URL or links
+      const linkWithSesskey = document.querySelector('a[href*="sesskey="]');
+      if (linkWithSesskey) {
+        const match = linkWithSesskey.href.match(/sesskey=([^&]+)/);
+        return match ? match[1] : null;
+      }
+      
+      return null;
+    });
+    
+    if (sesskey) {
+      console.log(`🔑 Found sesskey: ${sesskey}`);
+    } else {
+      console.log('⚠️  No sesskey found, might cause authentication issues');
+    }
+    
     // Debug: check if table exists
     const tableExists = await page.locator('table#mod_customcert_report_table').count();
     console.log(`🔍 Tables found: ${tableExists}`);
@@ -140,7 +188,9 @@ async function downloadCertificates() {
       console.log('📸 Full page screenshot saved for debugging');
     }
     
-    const students = await page.evaluate(() => {
+    const students = await page.evaluate((sesskeyParam) => {
+      // Store sesskey for use in download URLs
+      window.sesskeyForDownload = sesskeyParam;
       // Try multiple selectors
       let rows = document.querySelectorAll('table#mod_customcert_report_table tbody tr');
       
@@ -189,7 +239,12 @@ async function downloadCertificates() {
           const nameParts = fullText.split('\n').filter(part => part.trim());
           const studentName = nameParts[nameParts.length - 1].trim();
           
-          const downloadUrl = downloadLink.href;
+          let downloadUrl = downloadLink.href;
+          
+          // Add sesskey if available and not already in URL
+          if (window.sesskeyForDownload && !downloadUrl.includes('sesskey=')) {
+            downloadUrl += (downloadUrl.includes('?') ? '&' : '?') + 'sesskey=' + window.sesskeyForDownload;
+          }
           
           data.push({
             name: studentName,
@@ -199,7 +254,7 @@ async function downloadCertificates() {
       });
       
       return data;
-    });
+    }, sesskey);
     
     console.log(`📋 Found ${students.length} students`);
     
@@ -208,26 +263,68 @@ async function downloadCertificates() {
       console.log('📝 Sample student data:', students[0]);
     }
     
-    // Step 4: Download each certificate using fetch with browser cookies
+    // Step 4: Download certificates using a standalone API request context
+    // This is independent from the browser page, so closing the browser won't kill downloads
+    const { request: playwrightRequest } = await import('playwright');
+    
     // Get cookies from the browser session
     const cookies = await context.cookies();
-    
-    // Convert cookies to header format
-    const cookieHeader = cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
     console.log('🍪 Got session cookies');
+    
+    // Create a standalone request context with the session cookies
+    apiContext = await playwrightRequest.newContext({
+      extraHTTPHeaders: {
+        'Cookie': cookieHeader,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      },
+      timeout: 300000 // 5 minutes
+    });
+    console.log('\n🚀 Starting downloads... (This may take several minutes)');
+    console.log('⏰ Estimated time: ~2-5 minutes per certificate\n');
+    
+    let successCount = 0;
+    let errorCount = 0;
+    const startTime = Date.now();
     
     for (let i = 0; i < students.length; i++) {
       const student = students[i];
+      const downloadStartTime = Date.now();
       console.log(`\n📥 [${i + 1}/${students.length}] Downloading certificate for: ${student.name}`);
       
       try {
         console.log(`   📍 URL: ${student.downloadUrl}`);
+        console.log(`   ⏳ Requesting certificate... (may take 1-5 minutes, please wait)`);
         
-        // Use page.request to download with same session
-        const response = await page.request.get(student.downloadUrl);
+        // Use standalone API context (independent from browser page)
+        const response = await apiContext.get(student.downloadUrl, {
+          timeout: 300000 // 5 minutes timeout
+        });
+        
+        console.log(`   📡 HTTP Status: ${response.status()}`);
+        console.log(`   📋 Content-Type: ${response.headers()['content-type']}`);
         
         if (response.ok()) {
           const buffer = await response.body();
+          
+          console.log(`   📦 Downloaded ${buffer.length} bytes`);
+          
+          // Check if response is actually a PDF (or other binary file)
+          const contentType = response.headers()['content-type'] || '';
+          
+          if (contentType.includes('text/html')) {
+            console.error(`   ❌ Error: Got HTML instead of PDF (might be error page or redirect)`);
+            console.log(`   📝 First 500 chars of response: ${buffer.toString('utf8').substring(0, 500)}`);
+            errorCount++;
+            continue;
+          }
+          
+          if (buffer.length < 1000) {
+            console.error(`   ❌ Error: File too small (${buffer.length} bytes), probably not a valid certificate`);
+            console.log(`   📝 Content: ${buffer.toString('utf8')}`);
+            errorCount++;
+            continue;
+          }
           
           // Get filename from Content-Disposition header or default to .pdf
           const contentDisposition = response.headers()['content-disposition'];
@@ -241,12 +338,9 @@ async function downloadCertificates() {
             }
           }
           
-          console.log(`   📦 Downloaded ${buffer.length} bytes`);
-          
-          // Sanitize student name untuk filename
+          // Sanitize student name untuk filename (keep spaces, only remove invalid chars)
           const sanitizedName = student.name
-            .replace(/[^a-zA-Z0-9\s]/g, '') // Remove special chars
-            .replace(/\s+/g, '_') // Replace spaces with underscore
+            .replace(/[<>:"/\\|?*\x00-\x1F]/g, '') // Remove only Windows invalid filename chars
             .trim();
           
           // Save with student name
@@ -254,26 +348,64 @@ async function downloadCertificates() {
           const savePath = path.join(DOWNLOAD_DIR, newFilename);
           
           fs.writeFileSync(savePath, buffer);
-          console.log(`   ✅ Saved as: ${newFilename}`);
+          const downloadTime = ((Date.now() - downloadStartTime) / 1000).toFixed(1);
+          console.log(`   ✅ Saved locally: ${newFilename} (${buffer.length} bytes)`);
+          console.log(`   ⏱️  Download time: ${downloadTime}s`);
+          successCount++;
+          
+          // Upload to Google Drive if configured
+          if (driveAuth && GOOGLE_DRIVE_FOLDER_ID) {
+            try {
+              console.log(`   ☁️  Uploading to Google Drive...`);
+              const uploadResult = await uploadFile(driveAuth, savePath, newFilename, GOOGLE_DRIVE_FOLDER_ID);
+              
+              if (uploadResult.success) {
+                console.log(`   ✅ Uploaded to Drive: ${uploadResult.webViewLink}`);
+              } else {
+                console.log(`   ⚠️  Drive upload failed: ${uploadResult.error}`);
+              }
+            } catch (uploadError) {
+              console.log(`   ⚠️  Drive upload error: ${uploadError.message}`);
+            }
+          }
           
         } else {
           console.error(`   ❌ HTTP ${response.status()} for ${student.name}`);
+          errorCount++;
         }
         
         // Small delay to avoid overwhelming the server
-        await page.waitForTimeout(1000);
+        await new Promise(resolve => setTimeout(resolve, 2000));
         
       } catch (error) {
         console.error(`   ❌ Error downloading for ${student.name}:`, error.message);
+        errorCount++;
+      }
+      
+      // Show progress summary every 5 downloads
+      if ((i + 1) % 5 === 0 || i === students.length - 1) {
+        const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
+        const avgTimePerDownload = (Date.now() - startTime) / (i + 1) / 1000;
+        const remaining = students.length - (i + 1);
+        const estimatedMinutesLeft = (remaining * avgTimePerDownload / 60).toFixed(1);
+        
+        console.log(`\n📊 Progress: ${i + 1}/${students.length} | ✅ ${successCount} | ❌ ${errorCount} | ⏱️  ${elapsed}min elapsed | ~${estimatedMinutesLeft}min remaining`);
       }
     }
     
+    const totalTime = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
     console.log('\n\n🎉 All downloads completed!');
+    console.log(`📊 Summary:`);
+    console.log(`   ✅ Success: ${successCount}`);
+    console.log(`   ❌ Failed: ${errorCount}`);
+    console.log(`   📋 Total: ${students.length}`);
+    console.log(`   ⏱️  Total time: ${totalTime} minutes`);
     console.log(`📁 Files saved to: ${DOWNLOAD_DIR}`);
     
   } catch (error) {
     console.error('❌ Error:', error);
   } finally {
+    if (apiContext) await apiContext.dispose();
     await browser.close();
   }
 }
