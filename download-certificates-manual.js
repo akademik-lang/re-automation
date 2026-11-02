@@ -6,8 +6,10 @@ import dotenv from 'dotenv';
 import { authorize, uploadFile } from './google-drive.js';
 import data from './data.js';
 
-// Load environment variables
-dotenv.config();
+// Load environment variables (supports custom env file via ENV_FILE)
+const envFile = process.env.ENV_FILE || '.env';
+dotenv.config({ path: path.resolve(process.cwd(), envFile) });
+console.log(`⚙️  Loaded environment from: ${envFile}`);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -317,7 +319,20 @@ async function downloadCertificateAsStudent(page, studentName) {
  */
 async function downloadCertificatesManual() {
   console.log('🚀 Starting manual certificate download...');
-  console.log(`📋 Total students to process: ${data.length}\n`);
+
+  // Range student indexing (1-based index)
+  const startIndex = Math.max(1, parseInt(process.env.START_INDEX || '1', 10));
+  const endIndex = process.env.END_INDEX ? Math.min(data.length, parseInt(process.env.END_INDEX, 10)) : data.length;
+
+  if (startIndex > endIndex || startIndex > data.length) {
+    console.error(`❌ Invalid index range: START_INDEX (${startIndex}) must be <= END_INDEX (${endIndex}) and <= data.length (${data.length})`);
+    process.exit(1);
+  }
+
+  const targetStudents = data.slice(startIndex - 1, endIndex);
+
+  console.log(`📋 Total in data: ${data.length}`);
+  console.log(`🎯 Processing range: #${startIndex} to #${endIndex} (${targetStudents.length} students)\n`);
 
   // Validate config
   if (!CLASS_URL) {
@@ -355,9 +370,10 @@ async function downloadCertificatesManual() {
   // Login as admin first
   await loginAsAdmin(page);
 
-  for (let i = 0; i < data.length; i++) {
-    const studentName = data[i];
-    console.log(`\n📥 [${i + 1}/${data.length}] Processing: ${studentName}`);
+  for (let idx = 0; idx < targetStudents.length; idx++) {
+    const studentName = targetStudents[idx];
+    const originalIndex = startIndex + idx;
+    console.log(`\n📥 [${idx + 1}/${targetStudents.length}] (#${originalIndex}) Processing: ${studentName}`);
 
     let downloadResult = null;
 
@@ -397,7 +413,7 @@ async function downloadCertificatesManual() {
       // Take screenshot for debugging
       try {
         await page.screenshot({
-          path: path.join(DOWNLOAD_DIR, `error-${i + 1}-${studentName.replace(/\s+/g, '_')}.png`),
+          path: path.join(DOWNLOAD_DIR, `error-${originalIndex}-${studentName.replace(/\s+/g, '_')}.png`),
           fullPage: true
         });
         console.log(`   📸 Screenshot saved for debugging`);
@@ -422,13 +438,13 @@ async function downloadCertificatesManual() {
     }
 
     // Progress summary
-    if ((i + 1) % 5 === 0 || i === data.length - 1) {
+    if ((idx + 1) % 5 === 0 || idx === targetStudents.length - 1) {
       const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
-      const avgTime = (Date.now() - startTime) / (i + 1) / 1000;
-      const remaining = data.length - (i + 1);
+      const avgTime = (Date.now() - startTime) / (idx + 1) / 1000;
+      const remaining = targetStudents.length - (idx + 1);
       const estMin = (remaining * avgTime / 60).toFixed(1);
 
-      console.log(`\n📊 Progress: ${i + 1}/${data.length} | ✅ ${successCount} | ❌ ${errorCount} | ⏱️  ${elapsed}min elapsed | ~${estMin}min remaining`);
+      console.log(`\n📊 Progress: ${idx + 1}/${targetStudents.length} (Range #${startIndex}-#${endIndex}) | ✅ ${successCount} | ❌ ${errorCount} | ⏱️  ${elapsed}min elapsed | ~${estMin}min remaining`);
     }
   }
 
@@ -437,7 +453,7 @@ async function downloadCertificatesManual() {
   console.log(`📊 Summary:`);
   console.log(`   ✅ Success: ${successCount}`);
   console.log(`   ❌ Failed: ${errorCount}`);
-  console.log(`   📋 Total: ${data.length}`);
+  console.log(`   📋 Total Processed: ${targetStudents.length} (Range #${startIndex} - #${endIndex} of ${data.length})`);
   console.log(`   ⏱️  Total time: ${totalTime} minutes`);
   console.log(`📁 Files saved to: ${DOWNLOAD_DIR}`);
 

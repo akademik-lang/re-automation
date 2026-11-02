@@ -1,6 +1,7 @@
 node_modules/
 downloads/
 .env
+.env.2
 credentials.json
 token.json
 *.log
